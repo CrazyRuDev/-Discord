@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Discord Search Pager UI
+// @name         Поиск сообщений в Discord и сохранение в файл
 // @namespace    local.discord.search.pager
-// @version      0.4.0
+// @version      0.5.0
 // @description  Панель поверх Discord Web для постраничного сбора результатов поиска
 // @match        https://discord.com/channels/*
 // @grant        GM_setClipboard
@@ -18,8 +18,9 @@
     stopRequested: false,
     pages: [],
     lastStatus: '',
-    storageKey: 'discordPagerStateV4',
-    uiKey: 'discordPagerUiStateV4',
+    storageKey: 'discordPagerStateV5',
+    uiKey: 'discordPagerUiStateV5',
+    currentSearchKey: '',
   };
 
   function cleanText(s) {
@@ -31,15 +32,34 @@
       .trim();
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
   function normalizeForCompare(s) {
     return cleanText(s)
       .toLowerCase()
       .replace(/\s+/g, ' ')
       .trim();
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function sanitizeAuthor(s) {
+    return cleanText(s)
+      .replace(/\s*\[[^\]]+\]/g, '')
+      .replace(/\s*\((admin|moderator|mod|owner|staff|helper)[^)]*\)/gi, '')
+      .replace(/\s*,.*$/, '')
+      .replace(/[—–-]+\s*$/, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+  }
+
+  function getAuthorHint() {
+    const el = document.getElementById('dsp-author-hint');
+    return sanitizeAuthor(el ? el.value : '');
+  }
+
+  function getSearchKey() {
+    return normalizeForCompare(getAuthorHint());
   }
 
   function isDigit(ch) {
@@ -127,7 +147,7 @@
     }
 
     const normHint = normalizeForCompare(authorHint || '');
-    if (normHint && normalizeForCompare(s) === normHint) return false;
+    if (normHint && normalizeForCompare(sanitizeAuthor(s)) === normHint) return false;
 
     const oneWord = s.split(/\s+/).filter(Boolean).length === 1;
     if (oneWord && /^[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё0-9_-]{2,24}$/.test(s)) {
@@ -139,21 +159,6 @@
     }
 
     return false;
-  }
-
-  function sanitizeAuthor(s) {
-    return cleanText(s)
-      .replace(/\s*\[[^\]]+\]/g, '')
-      .replace(/\s*\((admin|moderator|mod|owner|staff|helper)[^)]*\)/gi, '')
-      .replace(/\s*,.*$/, '')
-      .replace(/[—–-]+\s*$/, '')
-      .replace(/\s{2,}/g, ' ')
-      .trim();
-  }
-
-  function readAuthorHint() {
-    const el = document.getElementById('dsp-author-hint');
-    return sanitizeAuthor(el ? el.value : '');
   }
 
   function stripKnownUiFragments(s) {
@@ -196,7 +201,7 @@
   }
 
   function splitTrailingAuthor(line, authorHint) {
-    let out = cleanText(line);
+    const out = cleanText(line);
     const hint = sanitizeAuthor(authorHint || '');
 
     if (hint) {
@@ -217,28 +222,13 @@
     };
   }
 
-  function guessAuthorFromBlock(lines, authorHint) {
-    const hint = sanitizeAuthor(authorHint || '');
-    if (hint) return hint;
-
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const s = sanitizeAuthor(lines[i]);
-      if (!s) continue;
-      if (s.length > 1 && s.length <= 32 && /^[A-Za-zА-Яа-яЁё0-9_. -]+$/.test(s) && !s.includes(':')) {
-        return s;
-      }
-    }
-
-    return '';
-  }
-
   function normalizePageText(text) {
     const lines = String(text || '')
       .split('\n')
       .map((x) => cleanText(x))
       .filter(Boolean);
 
-    const authorHint = readAuthorHint();
+    const authorHint = getAuthorHint();
     const out = [];
 
     for (let i = 0; i < lines.length; i++) {
@@ -253,24 +243,25 @@
         j += 1;
       }
 
-      const filtered = block.filter((line) => !isUiNoiseLine(line) && !looksLikeRoleLine(line, authorHint));
+      let filtered = block.filter((line) => !isUiNoiseLine(line));
+      filtered = filtered.filter((line) => !looksLikeRoleLine(line, authorHint));
       if (!filtered.length) {
         i = j - 1;
         continue;
       }
 
-      let author = guessAuthorFromBlock(filtered, authorHint);
+      let author = authorHint;
       let contentLines = filtered.slice();
-
-      if (!author && contentLines.length) {
-        const split = splitTrailingAuthor(contentLines[contentLines.length - 1], authorHint);
-        contentLines[contentLines.length - 1] = split.text;
-        if (split.author) author = split.author;
-      }
 
       if (author) {
         const normAuthor = normalizeForCompare(author);
         contentLines = contentLines.filter((line) => normalizeForCompare(sanitizeAuthor(line)) !== normAuthor);
+      }
+
+      if (contentLines.length) {
+        const split = splitTrailingAuthor(contentLines[contentLines.length - 1], author);
+        if (split.author) author = split.author;
+        contentLines[contentLines.length - 1] = split.text;
       }
 
       contentLines = contentLines
@@ -278,38 +269,23 @@
         .filter(Boolean)
         .filter((line) => !looksLikeRoleLine(line, author) && !isUiNoiseLine(line));
 
-      if (!contentLines.length) {
+      if (!contentLines.length || !author) {
         i = j - 1;
         continue;
       }
 
-      if (!author) {
-        const split = splitTrailingAuthor(contentLines[contentLines.length - 1], authorHint);
-        if (split.author) author = split.author;
-        contentLines[contentLines.length - 1] = split.text;
-      }
+      const mainMessage = cleanupContentLine(contentLines[contentLines.length - 1] || '', author);
+      const replyPreview = cleanupContentLine(contentLines.slice(0, -1).join(' '), author);
 
-      author = sanitizeAuthor(author || authorHint || '');
-      if (!author) {
+      if (!mainMessage) {
         i = j - 1;
         continue;
       }
 
-      const mainMessage = contentLines[contentLines.length - 1] || '';
-      const replyPreview = contentLines.slice(0, -1).join(' ').trim();
-
-      const finalMain = cleanupContentLine(mainMessage, author);
-      const finalReply = cleanupContentLine(replyPreview, author);
-
-      if (!finalMain) {
-        i = j - 1;
-        continue;
-      }
-
-      if (finalReply) {
-        out.push(`${timestamp} | ${author} | ↳ ${finalReply} || ${finalMain}`);
+      if (replyPreview) {
+        out.push(`${timestamp} | ${author} | ↳ ${replyPreview} || ${mainMessage}`);
       } else {
-        out.push(`${timestamp} | ${author} | ${finalMain}`);
+        out.push(`${timestamp} | ${author} | ${mainMessage}`);
       }
 
       i = j - 1;
@@ -328,7 +304,7 @@
   function saveUiState() {
     const host = document.getElementById('discord-search-pager-ui');
     const payload = {
-      authorHint: readAuthorHint(),
+      authorHint: getAuthorHint(),
       maxPages: document.getElementById('dsp-max-pages')?.value || '20',
       delayMs: document.getElementById('dsp-delay-ms')?.value || '4500',
       continueMode: !!document.getElementById('dsp-continue-mode')?.checked,
@@ -351,6 +327,7 @@
     const payload = {
       pages: STATE.pages,
       savedAt: new Date().toISOString(),
+      searchKey: STATE.currentSearchKey,
     };
     localStorage.setItem(STATE.storageKey, JSON.stringify(payload));
     window.__discordPagesDump = STATE.pages;
@@ -364,6 +341,7 @@
       if (!raw) return;
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed.pages)) STATE.pages = parsed.pages;
+      STATE.currentSearchKey = parsed.searchKey || '';
       window.__discordPagesDump = STATE.pages;
       window.__discordMergedDump = getMergedText();
     } catch (e) {
@@ -373,10 +351,38 @@
 
   function clearState() {
     STATE.pages = [];
+    STATE.currentSearchKey = '';
     localStorage.removeItem(STATE.storageKey);
     window.__discordPagesDump = [];
     window.__discordMergedDump = '';
     renderStats();
+  }
+
+  function ensureSearchContext() {
+    const key = getSearchKey();
+    if (!key) {
+      setStatus('Сначала укажите ник автора в панели');
+      return false;
+    }
+
+    if (!STATE.currentSearchKey) {
+      STATE.currentSearchKey = key;
+      saveState();
+      return true;
+    }
+
+    if (STATE.currentSearchKey !== key) {
+      const continueMode = document.getElementById('dsp-continue-mode')?.checked;
+      if (continueMode) {
+        setStatus('Ник автора изменился. Нажмите «Очистить» или снимите галочку продолжения');
+        return false;
+      }
+      clearState();
+      STATE.currentSearchKey = key;
+      saveState();
+    }
+
+    return true;
   }
 
   function setStatus(text) {
@@ -483,12 +489,17 @@
 
   async function startCollection() {
     if (STATE.running) return;
+    if (!ensureSearchContext()) return;
 
     const maxPages = Math.max(1, Number(document.getElementById('dsp-max-pages').value || 1));
     const delayMs = Math.max(500, Number(document.getElementById('dsp-delay-ms').value || 4500));
     const continueMode = document.getElementById('dsp-continue-mode').checked;
 
-    if (!continueMode) clearState();
+    if (!continueMode) {
+      clearState();
+      STATE.currentSearchKey = getSearchKey();
+      saveState();
+    }
 
     const panel = findRightScrollablePanel();
     if (!panel) {
@@ -534,7 +545,7 @@
           renderStats();
         }
 
-        setStatus(`Собрана страница ${pageNo}${totalPages ? '/' + totalPages : ''}`);
+        setStatus(`Собрана страница ${pageNo}${totalPages ? '/' + totalPages : ''} для ${getAuthorHint()}`);
 
         const nextBtn = findNextPageButton(paginationRoot);
         if (!nextBtn) {
@@ -823,5 +834,5 @@
 
   loadState();
   createUI();
-  setStatus('Панель загружена. Укажите ник автора, откройте поиск в Discord и нажмите Старт');
+  setStatus('Панель загружена. Укажите ник автора, затем откройте поиск в Discord и нажмите Старт');
 })();
